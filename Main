@@ -1,0 +1,310 @@
+import pandas as pd
+from datetime import date, timedelta
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+from pptx import Presentation
+from pptx.util import Inches
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+import io, re, os
+
+# --- Configuration ---
+STATUS_COLORS = {
+    'Completed': '#2E8B57',
+    'In Progress': '#FFB300',
+    'Pending': '#E74C3C',
+}
+COLUMNS = ['Activity','Task','Date','Start','End','Status','Owner','Notes','LaneOrder','Color']
+LABEL_X_GAP = 0.0
+LABEL_ROWS = [0.25, 0.45, 0.65, 0.85]
+LABEL_ROW_HEIGHT = 0.28
+CLOSE_THRESHOLD = 3
+LABEL_X_STEP_DAYS = 1.25
+LABEL_MIN_GAP_DAYS = 0.6
+USE_LABEL_BBOX = True
+LABEL_FONT_SIZE = 8.5
+SHOW_DATE_IN_LABEL = True
+SHOW_DATE_UNDER_MARKER = False
+DATE_FORMAT = '%m/%d/%Y'
+TASK_DATE_FORMAT = '%m/%d'
+
+# --- Helper functions ---
+def parse_date(value):
+    if pd.isna(value) or value is None or str(value).strip() == '':
+        return None
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        return None
+
+def month_gridlines(ax, start, end):
+    cur = date(start.year, start.month, 1)
+    y_top = ax.get_ylim()[1]
+    while cur <= end:
+        ax.axvline(cur, color='#C0C0C0', linestyle=(0, (3, 6)), linewidth=0.8)
+        ax.text(mdates.date2num(cur) + 2, y_top + 0.2, cur.strftime('%b-%y'),
+                fontsize=9, color='#1F1F1F', va='bottom')
+        cur = date(cur.year + (cur.month // 12), (cur.month % 12) + 1, 1)
+
+def week_gridlines(ax, start, end):
+    cur = start - timedelta(days=start.weekday())
+    y_top = ax.get_ylim()[1]
+    while cur <= end:
+        ax.axvline(cur, color='#E0E0E0', linestyle='--', linewidth=0.5)
+        week_num = cur.isocalendar()[1]
+        ax.text(mdates.date2num(cur) + 1, y_top + 0.05, f"W{week_num:02d}",
+                fontsize=7, color='#666666', va='bottom', ha='left')
+        cur += timedelta(days=7)
+
+def text_width_in_days(ax, s, fontsize):
+    s = str(s)
+    lines = s.split('\n')
+    max_chars = max((len(line) for line in lines), default=0)
+    pt_per_char = 0.6
+    w_pt = max(6, max_chars * pt_per_char * fontsize)
+    dpi = ax.figure.dpi
+    w_px = (w_pt / 72.0) * dpi
+    ax_w_px = ax.get_window_extent().width
+    x0, x1 = ax.get_xlim()
+    days_per_px = (x1 - x0) / ax_w_px if ax_w_px > 0 else 0.0
+    return max(0.2, w_px * days_per_px)
+
+def collides(existing, y_pos, x_center, width_days, height_units=LABEL_ROW_HEIGHT):
+    half_w = width_days / 2.0
+    for (x_prev, y_prev, w_prev, h_prev) in existing:
+        horiz_overlap = abs(x_center - x_prev) < (half_w + w_prev / 2.0 + LABEL_MIN_GAP_DAYS)
+        vert_overlap = abs(y_pos - y_prev) < ((height_units + h_prev) / 2.0)
+        if horiz_overlap and vert_overlap:
+            return True
+    return False
+
+def find_x_no_collision(existing, y_pos, x0, width_days, height_units=LABEL_ROW_HEIGHT):
+    if not collides(existing, y_pos, x0, width_days, height_units):
+        return x0
+    for i in range(1, 15):
+        for sign in (-1, 1):
+            x_try = x0 + sign * LABEL_X_STEP_DAYS * i
+            if not collides(existing, y_pos, x_try, width_days, height_units):
+                return x_try
+    return x0
+
+# --- Timeline drawing ---
+def draw_timeline(df, start=None, end=None, show_today=True,
+                  title='Action Plan Timeline', outfile_png=None,
+                  show_date_in_label=SHOW_DATE_IN_LABEL,
+                  show_date_under_marker=SHOW_DATE_UNDER_MARKER,
+                  date_fmt=DATE_FORMAT):
+    work = df.copy()
+    for col in ['Date','Start','End']:
+        work[col] = work[col].apply(parse_date)
+    all_dates = [d for col in ['Date','Start','End'] for d in work[col].dropna()]
+    if not all_dates:
+        raise ValueError('No valid dates found.')
+    min_d = min(all_dates) if start is None else start
+    max_d = max(all_dates) if end is None else end
+    fig_h = max(6, 1.2 * work['Activity'].nunique())
+    fig, ax = plt.subplots(figsize=(14, fig_h))
+    fig.text(0.02, 0.97, title, fontsize=14, weight='bold', ha='left', va='top', color='red')
+    lanes = work[['Activity','LaneOrder']].drop_duplicates().sort_values('LaneOrder')
+    lane_y = {act: i for i, act in enumerate(lanes['Activity'].tolist()[::-1], start=1)}
+    ax.set_ylim(0.5, len(lane_y) + 0.5)
+    ax.set_xlim(min_d - timedelta(days=5), max_d + timedelta(days=10))
+    ax.get_yaxis().set_visible(False)
+    ax.grid(False)
+    fig.canvas.draw()
+    placed_labels = {act: [] for act in lane_y.keys()}
+    for act, y in lane_y.items():
+        subset = work[work['Activity'] == act].sort_values('Date')
+        ax.text(mdates.date2num(min_d) - 5, y, act, ha='right', va='center',
+                fontsize=10, weight='bold', color='#1F1F1F')
+        if not subset.empty:
+            all_task_dates = [parse_date(row[c]) for _, row in subset.iterrows()
+                              for c in ['Date','Start','End'] if parse_date(row[c])]
+            if all_task_dates:
+                ax.hlines(y, mdates.date2num(min(all_task_dates)),
+                          mdates.date2num(max(all_task_dates)),
+                          color='#808080', linewidth=2.0)
+        last_x = None
+        level_idx = 0
+        for _, row in subset.iterrows():
+            task = str(row['Task'])
+            status = (str(row['Status']) if pd.notna(row['Status']) else '').strip()
+            color = row['Color'] if pd.notna(row['Color']) and str(row['Color']).startswith('#') \
+                    else STATUS_COLORS.get(status, '#6B6B6B')
+            start_d, end_d, date_d = row['Start'], row['End'], row['Date']
+            if start_d and end_d:
+                x0, x1 = mdates.date2num(start_d), mdates.date2num(end_d)
+                rect = Rectangle((x0, y - 0.15), x1 - x0, 0.3,
+                                 facecolor=color, alpha=0.35, edgecolor=color, linewidth=1.2)
+                ax.add_patch(rect)
+                ax.plot([start_d, end_d], [y, y], color=color, linewidth=2)
+            if date_d:
+                x = mdates.date2num(date_d)
+                ax.plot(date_d, y, marker='o', markersize=8, color=color,
+                        markeredgecolor='black', markeredgewidth=0.6)
+                if show_date_under_marker:
+                    ax.text(x, y - 0.22, date_d.strftime(TASK_DATE_FORMAT),
+                            fontsize=8, ha='center', va='top', color='#333333')
+                level_idx = (level_idx + 1) % len(LABEL_ROWS) if last_x and abs(x - last_x) < CLOSE_THRESHOLD else 0
+                y_offset = LABEL_ROWS[level_idx]
+                last_x = x
+                label_text = f"{task}\n{date_d.strftime(TASK_DATE_FORMAT)}" if show_date_in_label else task
+                width_days = text_width_in_days(ax, label_text, fontsize=LABEL_FONT_SIZE)
+                x_label = find_x_no_collision(placed_labels[act], y + y_offset, x + LABEL_X_GAP, width_days)
+                if abs(x_label - x) > 0.2 or y_offset > LABEL_ROWS[0]:
+                    ax.annotate("", xy=(x, y), xytext=(x_label, y + y_offset),
+                                arrowprops=dict(arrowstyle="-", color=color, lw=0.8))
+                bbox = dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='#B0B0B0') if USE_LABEL_BBOX else None
+                ax.text(x_label, y + y_offset, label_text, fontsize=LABEL_FONT_SIZE,
+                        va='bottom', ha='center', color='#1F1F1F', bbox=bbox)
+                placed_labels[act].append((x_label, y + y_offset, width_days, LABEL_ROW_HEIGHT))
+    week_gridlines(ax, min_d, max_d)
+    month_gridlines(ax, min_d, max_d)
+    if show_today:
+        today = date.today()
+        ax.axvline(today, color='#0078D4', linestyle='--', linewidth=2)
+        ax.text(mdates.date2num(today), 0.3, today.strftime('%m/%d'),
+                color='#0078D4', fontsize=9, ha='center', va='top')
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    if outfile_png: fig.savefig(outfile_png, dpi=200)
+    return fig, ax
+
+# --- GUI Application ---
+class TimelineApp:
+    def __init__(self, root):
+        self.root = root
+        root.title('LineView')
+        root.geometry('850x520')
+        root.configure(bg='#E9EEF3')
+
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TLabel', background='#E9EEF3', font=('Segoe UI', 10))
+        style.configure('TButton', font=('Segoe UI', 10, 'bold'), padding=6)
+        style.configure('TCheckbutton', background='#E9EEF3', font=('Segoe UI', 9))
+
+        # --- Header ---
+        header = tk.Frame(root, bg='#0078D4', height=45)
+        header.pack(fill='x')
+        tk.Label(header, text='📊 LineView - Your Timline Generator ^_^', bg='#0078D4',
+                 fg='white', font=('Segoe UI Semibold', 13)).pack(side='left', padx=12)
+        tk.Button(header, text='About', bg='white', fg='#0078D4', relief='flat',
+                  font=('Segoe UI', 9, 'bold'), command=self.show_info).pack(side='right', padx=10, pady=5)
+
+        main = ttk.Frame(root, padding=12)
+        main.pack(fill='both', expand=True)
+
+        # --- Section 1: File Selection ---
+        file_frame = tk.LabelFrame(main, text='📁 File Selection', bg='#FDFDFD', fg='#0078D4', font=('Segoe UI Semibold', 10))
+        file_frame.pack(fill='x', pady=6)
+        self.path_var = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.path_var).pack(side='left', fill='x', expand=True, padx=6, pady=6)
+        tk.Button(file_frame, text='Browse', bg='#6C757D', fg='white', command=self.browse).pack(side='left', padx=4)
+        tk.Button(file_frame, text='Open Excel', bg='green', fg='white', command=self.open_excel).pack(side='left', padx=4)
+
+        # --- Section 2: Chart Options ---
+        opt_frame = tk.LabelFrame(main, text='⚙️ Chart Options', bg='#FDFDFD', fg='#0078D4', font=('Segoe UI Semibold', 10))
+        opt_frame.pack(fill='x', pady=6)
+        self.title_var = tk.StringVar(value='Action Plan – TV R&D')
+        ttk.Label(opt_frame, text='Chart title:').grid(row=0, column=0, sticky='w', padx=6, pady=4)
+        ttk.Entry(opt_frame, textvariable=self.title_var, width=50).grid(row=0, column=1, sticky='w', padx=6, pady=4)
+        self.show_today_var = tk.BooleanVar(value=True)
+        self.show_date_in_label_var = tk.BooleanVar(value=True)
+        self.show_date_under_marker_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_frame, text='Show today line', variable=self.show_today_var).grid(row=1, column=0, sticky='w', padx=6)
+        ttk.Checkbutton(opt_frame, text='Show date inside labels', variable=self.show_date_in_label_var).grid(row=1, column=1, sticky='w', padx=6)
+        ttk.Checkbutton(opt_frame, text='Show date under marker', variable=self.show_date_under_marker_var).grid(row=1, column=2, sticky='w', padx=6)
+
+        # --- Section 3: Actions ---
+        act_frame = tk.LabelFrame(main, text='🚀 Actions', bg='#FDFDFD', fg='#0078D4', font=('Segoe UI Semibold', 10))
+        act_frame.pack(fill='x', pady=6)
+        tk.Button(act_frame, text='Generate in Excel', bg='#28A745', fg='white', command=self.generate_and_insert).pack(side='left', padx=6, pady=6)
+        tk.Button(act_frame, text='Export to PPT/PNG', bg='#17A2B8', fg='white', command=self.export_ppt).pack(side='left', padx=6, pady=6)
+
+        # --- Section 4: Status ---
+        status_frame = tk.LabelFrame(main, text='ℹ️ Status', bg='#FDFDFD', fg='#0078D4', font=('Segoe UI Semibold', 10))
+        status_frame.pack(fill='x', pady=6)
+        self.msg = tk.StringVar()
+        ttk.Label(status_frame, textvariable=self.msg, foreground='#0078D4', font=('Segoe UI', 9, 'italic')).pack(anchor='w', padx=8, pady=4)
+
+    def show_info(self):
+        messagebox.showinfo('About', 'Developed by Eng. Ammar Haggag\n\nDedicated to Eng. Amir Elgazar.')
+
+    def browse(self):
+        path = filedialog.askopenfilename(filetypes=[('Excel files','*.xlsx')])
+        if path:
+            self.path_var.set(path)
+
+    def open_excel(self):
+        path = self.path_var.get()
+        if not path or not os.path.exists(path):
+            messagebox.showerror('Error', 'Please select a valid Excel file first.')
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror('Error', f'Cannot open file:\n{e}')
+
+    def _sanitize_filename(self, title):
+        safe = re.sub(r'[^A-Za-z0-9_-]+', '_', title.strip())
+        return safe or "timeline"
+
+    def _load_df(self):
+        df = pd.read_excel(self.path_var.get(), engine='openpyxl')
+        missing = [c for c in COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(f'Missing columns: {missing}')
+        return df
+
+    def generate_and_insert(self):
+        try:
+            df = self._load_df()
+            base_name = self._sanitize_filename(self.title_var.get())
+            png_name = f"{base_name}.png"
+            fig, ax = draw_timeline(df, show_today=self.show_today_var.get(),
+                                    title=self.title_var.get(), outfile_png=png_name,
+                                    show_date_in_label=self.show_date_in_label_var.get(),
+                                    show_date_under_marker=self.show_date_under_marker_var.get(),
+                                    date_fmt=DATE_FORMAT)
+            plt.close(fig)
+            excel_path = self.path_var.get()
+            wb = load_workbook(excel_path)
+            ws = wb.worksheets[0]
+            img = XLImage(png_name)
+            img.anchor = 'L1'
+            ws.add_image(img)
+            wb.save(excel_path)
+            self.msg.set(f"✅ Image inserted into Sheet1 at cell L1 in '{os.path.basename(excel_path)}'.")
+        except Exception as e:
+            messagebox.showerror('Error', str(e))
+
+    def export_ppt(self):
+        try:
+            df = self._load_df()
+            base_name = self._sanitize_filename(self.title_var.get())
+            png_name = f"{base_name}.png"
+            ppt_name = f"{base_name}.pptx"
+            fig, ax = draw_timeline(df, show_today=self.show_today_var.get(),
+                                    title=self.title_var.get(), outfile_png=png_name,
+                                    show_date_in_label=self.show_date_in_label_var.get(),
+                                    show_date_under_marker=self.show_date_under_marker_var.get(),
+                                    date_fmt=DATE_FORMAT)
+            plt.close(fig)
+            prs = Presentation()
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            with open(png_name, 'rb') as f:
+                image_blob = f.read()
+            slide.shapes.add_picture(io.BytesIO(image_blob), Inches(0.5), Inches(0.5), width=Inches(9.0))
+            prs.save(ppt_name)
+            self.msg.set(f"✅ Saved: {ppt_name}")
+        except Exception as e:
+            messagebox.showerror('Error', str(e))
+
+# --- Run app ---
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = TimelineApp(root)
+    root.mainloop()
